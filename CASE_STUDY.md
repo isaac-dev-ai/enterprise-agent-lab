@@ -12,8 +12,8 @@ Enterprise teams evaluating AI-agent adoption commonly need the same real shape 
 
 - A real, working MCP server (official `mcp` Python SDK) exposing read tools and one narrowly-scoped, gated write tool.
 - The SAME representative workflow implemented and verified two independent ways: plain, sequential Python (`orchestrator_native.py`) and a real `langgraph.graph.StateGraph` (`orchestrator_langgraph.py`) -- both driving the identical live MCP tool surface.
-- A real, deny-by-default execution guard: every write attempt is either denied by default, allowed via an explicit `dry_run` preview, or allowed via a real, named human approval -- every attempt, allowed or denied, is recorded in an append-only audit log.
-- A real, passing, standalone test suite (`test_agent_lab.py`) exercising the full propose -> deny -> approve -> execute -> audit chain.
+- A real, deny-by-default execution guard: every write attempt is either denied by default, allowed via an explicit `dry_run` preview, or allowed after a real, separate human-approval step (`approve_pending.py`, run out-of-process -- the agent/orchestrator has no parameter through which it can supply its own approval) -- every attempt, allowed or denied, is recorded in a DB-enforced, append-only audit log.
+- A real, passing test suite in two tiers: `test_agent_lab.py` (direct-call unit/component tests exercising the full propose -> deny -> approve -> execute -> audit chain, plus append-only/idempotency/authorization-vs-execution behavior) and `test_mcp_integration.py` (real tests over the actual MCP stdio protocol against a live server subprocess).
 
 ## What this project does NOT prove
 

@@ -2,41 +2,59 @@
 
 Uses Anthropic's official `mcp` Python SDK (PyPI: `mcp`, free, open
 source). Demonstrates a real, controlled agent-tool-access pattern:
-read tools, one narrowly-scoped, deny-by-default gated write tool,
-human approval, dry-run mode, and an append-only audit log -- the same
-real architecture pattern this project's author built and tested
-inside a larger private system, extracted here as a small, generic,
-standalone reference implementation over synthetic data only.
+read tools, one narrowly-scoped, deny-by-default gated write path,
+a real, independent human-approval boundary, dry-run mode, and an
+append-only audit log -- the same real architecture pattern this
+project's author built and tested inside a larger private system,
+extracted here as a small, generic, standalone reference implementation
+over synthetic data only.
 
 This server never claims to connect to any real employer's actual
 systems. `demo_records` stands in for whatever real business records a
 real deployment would read (a support ticket, an invoice, a job
 posting, a claims filing) -- the read/write/approval/audit PATTERN
 generalizes; the specific business domain does not need to.
+
+Write path, in two structurally separate steps -- neither this server
+nor any orchestrator calling it can grant its own approval:
+
+    propose_decision(dry_run=False) -> real, persisted PENDING row -> STOP
+    (a separate human runs approve_pending.py, off this process entirely)
+    execute_decision(approval_id) -> reads the persisted decision, never
+                                      accepts one as a parameter
+
+This demo establishes separation of the approval step from the agent
+execution path. It does not implement enterprise identity authentication
+-- `approved_by` is a real, disclosed, un-authenticated CLI-entered
+string, not a verified identity.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
 
+import approvals
 import decision_journal as dj
 import execution_guard
 from schema import init_db
 
 ROOT = Path(__file__).resolve().parent
-DEMO_DB_PATH = ROOT / "agent_lab_demo.db"
+DEMO_DB_PATH = Path(os.environ.get("AGENT_LAB_DEMO_DB_PATH") or str(ROOT / "agent_lab_demo.db"))
 
 server = MCPServer(
     name="enterprise-agent-lab",
     title="Enterprise Agent Lab",
     description=(
         "A real, working reference implementation of controlled AI-agent access to enterprise-shaped "
-        "tools: read tools, one deny-by-default gated write tool, human approval, dry-run mode, and an "
-        "append-only audit log. Deterministic, zero-LLM-call business logic -- every field is either "
-        "real synthetic-data evidence or explicitly 'unknown,' never fabricated."
+        "tools: read tools, one deny-by-default gated write path split into propose/execute steps, a "
+        "real independent human-approval boundary (approve_pending.py, run out-of-process), dry-run "
+        "mode, and a DB-enforced append-only audit log. Deterministic, zero-LLM-call business logic -- "
+        "every field is either real synthetic-data evidence or explicitly 'unknown,' never fabricated."
     ),
     version="1.0.0",
 )
@@ -128,43 +146,171 @@ def classify_record(record_id: int) -> dict:
 @server.tool()
 def propose_decision(
     decision: str, reasoning: str, prediction: str, expected_outcome: str,
-    confidence: str = "unknown", related_item_name: str = "",
-    *, dry_run: bool = True, human_approved: bool = False, approved_by: str = "",
+    confidence: str = "unknown", related_item_name: str = "", *, dry_run: bool = True,
 ) -> dict:
-    """The ONE real, least-privilege, gated write tool. Calls
-    `execution_guard.authorize()` (real, deny-by-default) and only
-    writes to `decision_journal_entries` when authorized. `dry_run=True`
-    (the default) always previews without writing. `dry_run=False` with
-    `human_approved=False` is denied by the guard's fail-closed default.
-    `dry_run=False` with `human_approved=True` and a real, non-blank
-    `approved_by` overrides the lock for this one action and performs
-    the real write -- every attempt, allowed or denied, is recorded in
-    the append-only `execution_guard_log` audit trail."""
+    """Step 1 of the ONE real, least-privilege write path. `dry_run=True`
+    (the default) previews the exact row that would be written, with
+    zero side effects -- no approval request is created. `dry_run=False`
+    creates a real, persisted PENDING `approval_requests` row and stops
+    there: no write happens in this call, and this tool has no parameter
+    that can mark that row approved. A real write only ever happens via
+    a later, separate `execute_decision(approval_id)` call, after a
+    separate human process (`approve_pending.py`) has approved it.
+    Every call here -- preview or pending -- is still recorded in the
+    append-only `execution_guard_log` audit trail. Neither call here is
+    itself the gated external write (creating a pending request touches
+    no business data), so `is_external_write=False` here -- the real
+    external-write lock is enforced once, in `execute_decision()`."""
     guard_decision = execution_guard.authorize(
-        "propose_decision", is_external_write=True, estimated_cost=0.0, dry_run=dry_run,
-        human_approved=human_approved, approved_by=approved_by, api_name="decision_journal_entries",
+        "propose_decision", is_external_write=False, estimated_cost=0.0, dry_run=dry_run,
+        human_approved=False, approved_by="", api_name="decision_journal_entries",
         db_path=DEMO_DB_PATH,
     )
-    result: dict = {
-        "authorized": guard_decision.allowed, "reason": guard_decision.reason,
-        "dry_run": guard_decision.dry_run, "entry_id": None,
-    }
-    if not guard_decision.allowed:
-        return result
     preview = {
         "decision": decision, "reasoning": reasoning, "prediction": prediction,
         "expected_outcome": expected_outcome, "confidence": confidence, "related_item_name": related_item_name,
     }
-    if dry_run:
-        result["preview"] = preview
+    result: dict = {
+        "authorized": guard_decision.allowed, "reason": guard_decision.reason,
+        "dry_run": dry_run, "entry_id": None, "approval_id": None, "preview": preview,
+    }
+    if not guard_decision.allowed:
+        result["status"] = "denied"
         return result
-    entry_id = dj.record_decision(
-        decision, reasoning=reasoning, prediction=prediction, expected_outcome=expected_outcome,
-        confidence=confidence, related_item_name=related_item_name,
-        recorded_by=approved_by or "agent", db_path=DEMO_DB_PATH,
-    )
-    result["entry_id"] = entry_id
+    if dry_run:
+        result["status"] = "preview_only"
+        return result
+    approval_id = approvals.create_approval_request("propose_decision", preview, db_path=DEMO_DB_PATH)
+    result["approval_id"] = approval_id
+    result["status"] = "pending_approval"
     return result
+
+
+def _claim_approval_for_execution(approval_id: int) -> bool:
+    """Atomically moves one 'approved' request to 'executed' so a second,
+    concurrent execute_decision() call for the same approval_id cannot
+    also authorize/write. Returns True iff this call won the claim."""
+    conn = init_db(DEMO_DB_PATH)
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "UPDATE approval_requests SET status = 'executed' WHERE id = ? AND status = 'approved'",
+            (approval_id,),
+        )
+        conn.execute("COMMIT")
+        return cur.rowcount == 1
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def _record_execution_attempt(
+    *, approval_id: int, authorized: bool, authorization_reason: str,
+    execution_succeeded: bool, execution_error: str | None, decision_journal_entry_id: int | None,
+) -> None:
+    conn = init_db(DEMO_DB_PATH)
+    try:
+        conn.execute(
+            """
+            INSERT INTO execution_attempts
+                (approval_id, authorized, authorization_reason, execution_succeeded,
+                 execution_error, decision_journal_entry_id)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (approval_id, 1 if authorized else 0, authorization_reason,
+             1 if execution_succeeded else 0, execution_error, decision_journal_entry_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _last_execution_attempt(approval_id: int) -> dict | None:
+    conn = init_db(DEMO_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT * FROM execution_attempts WHERE approval_id = ? ORDER BY id DESC LIMIT 1", (approval_id,)
+        ).fetchone()
+        return dict(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+@server.tool()
+def execute_decision(approval_id: int) -> dict:
+    """Step 2 of the write path. Looks up the real, persisted
+    `approval_requests` row for `approval_id` and reads its status --
+    this tool has no `human_approved`/`approved_by` parameter, so an
+    agent/orchestrator calling it cannot supply its own approval fact,
+    only reference an approval_id it hopes was approved out-of-band.
+    Idempotent: a second call for an already-executed approval_id
+    returns the original recorded outcome rather than re-authorizing or
+    re-attempting the write. Authorization success and execution success
+    are tracked separately in `execution_attempts` -- an authorized
+    request whose real write then fails (e.g. invalid `confidence`) is
+    never reported as if the write had happened."""
+    approval = approvals.get_approval_request(approval_id, db_path=DEMO_DB_PATH)
+    if approval is None:
+        return {"error": f"No approval_request with id={approval_id}"}
+
+    if approval["status"] == "executed":
+        prior = _last_execution_attempt(approval_id)
+        return {
+            "approval_id": approval_id, "status": "already_executed",
+            "authorized": bool(prior["authorized"]) if prior else None,
+            "execution_succeeded": bool(prior["execution_succeeded"]) if prior else None,
+            "entry_id": prior["decision_journal_entry_id"] if prior else None,
+            "previous_attempt": prior,
+        }
+
+    human_approved = approval["status"] == "approved"
+    if human_approved and not _claim_approval_for_execution(approval_id):
+        # Lost a real race to another concurrent execute_decision() call.
+        prior = _last_execution_attempt(approval_id)
+        return {
+            "approval_id": approval_id, "status": "already_executed",
+            "authorized": bool(prior["authorized"]) if prior else None,
+            "execution_succeeded": bool(prior["execution_succeeded"]) if prior else None,
+            "entry_id": prior["decision_journal_entry_id"] if prior else None,
+            "previous_attempt": prior,
+        }
+
+    guard_decision = execution_guard.authorize(
+        approval["action"], is_external_write=True, estimated_cost=0.0, dry_run=False,
+        human_approved=human_approved, approved_by=approval["approved_by"] if human_approved else "",
+        api_name="decision_journal_entries", db_path=DEMO_DB_PATH,
+    )
+
+    execution_succeeded = False
+    execution_error: str | None = None
+    entry_id: int | None = None
+    if guard_decision.allowed:
+        payload = json.loads(approval["payload_json"])
+        try:
+            entry_id = dj.record_decision(
+                payload["decision"], reasoning=payload["reasoning"], prediction=payload["prediction"],
+                expected_outcome=payload["expected_outcome"], confidence=payload["confidence"],
+                related_item_name=payload.get("related_item_name", ""),
+                recorded_by=approval["approved_by"] or "agent", db_path=DEMO_DB_PATH,
+            )
+            execution_succeeded = True
+        except dj.DecisionJournalError as exc:
+            execution_error = str(exc)
+
+    _record_execution_attempt(
+        approval_id=approval_id, authorized=guard_decision.allowed,
+        authorization_reason=guard_decision.reason, execution_succeeded=execution_succeeded,
+        execution_error=execution_error, decision_journal_entry_id=entry_id,
+    )
+
+    return {
+        "approval_id": approval_id, "authorized": guard_decision.allowed, "reason": guard_decision.reason,
+        "execution_succeeded": execution_succeeded, "execution_error": execution_error, "entry_id": entry_id,
+    }
 
 
 @server.tool()
