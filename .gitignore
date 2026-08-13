@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+agent_lab_demo.db
+test_agent_lab_demo.db
+.venv/
