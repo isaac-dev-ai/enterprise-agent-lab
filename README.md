@@ -97,5 +97,6 @@ python3 -m unittest test_mcp_integration.py -v     # MCP integration tests -- re
 - No enterprise identity authentication is implemented -- approval identity is a real, disclosed, un-authenticated CLI-entered string (see Human-approval model).
 - No real SOX audit, compliance certification, or production-scale deployment experience is claimed -- only the control *pattern* is real.
 - The classification rule (`_classify_record`) is intentionally simple and transparent, not a claim of sophisticated ML.
+- Local resumption is driven via CLI re-invocation (`--execute-approval <id>`) to keep execution fully transparent without requiring distributed orchestration infrastructure. In enterprise production, this boundary would be managed by durable execution engines (e.g., Temporal or LangGraph Cloud checkpointers) providing asynchronous pause/resume primitives.
 
 See `CASE_STUDY.md` for the real, specific origin story behind this project and a fuller honest-scope discussion.
